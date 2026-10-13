@@ -1,26 +1,4 @@
-"""Boucle d'entraînement + évaluation suivies dans MLflow, réutilisable d'un essai à l'autre.
-
-Le notebook prépare les données, le modèle, la loss et l'optimiseur ; ce module fait le reste :
-entraînement avec suivi de la validation, rechargement du meilleur modèle, évaluation
-sur le test, logging MLflow, et renvoie de quoi analyser les prédictions.
-
-Usage depuis un notebook de notebook/ :
-    import sys; sys.path.insert(0, "../scripts")
-    from train import run_experiment
-
-    result = run_experiment(
-        model, criterion, optimizer,
-        train_loader, val_loader, test_loader,
-        classes=classes,
-        experiment_name="infrared-solar-custom-cnn",
-        run_name="simplecnn-weighted-aug",
-        num_epochs=15,
-        params={"augmentation": "hflip+vflip"},
-    )
-    result["confusion_matrix"], result["roc_auc"], result["predictions"]
-"""
-
-from __future__ import annotations
+"""Training loop, test evaluation and MLflow logging shared by the CNN notebooks."""
 
 import copy
 
@@ -32,16 +10,17 @@ import torch
 from mlflow.models import infer_signature
 from sklearn.metrics import f1_score
 
-# Métriques et config MLflow partagées avec les modèles évalués hors de ce script.
 from evaluation import (compare_runs, evaluate_predictions, log_metrics_if_active,  # noqa: F401
                         log_splits, setup_mlflow)
 
+# Ordinal blue ramp: light = input layer, dark = output layer.
+_DEPTH_RAMP = ["#86b6ef", "#6da7ec", "#5598e7", "#3987e5", "#2a78d6",
+               "#256abf", "#1c5cab", "#184f95", "#104281", "#0d366b"]
+_INK, _MUTED, _GRID = "#52514e", "#898781", "#e1e0d9"
 
-# ----------------------------------------------------------------
-# INFÉRENCE
-# ----------------------------------------------------------------
+
 def predict(model, loader, device, criterion=None):
-    """Passe un loader dans le modèle. Renvoie labels, préds, probas et la loss moyenne."""
+    """Return labels, predictions, probabilities and mean loss (None without criterion)."""
     model.eval()
     total_loss, all_labels, all_probs = 0.0, [], []
     with torch.no_grad():
@@ -59,16 +38,9 @@ def predict(model, loader, device, criterion=None):
     return labels, probs.argmax(1), probs, loss
 
 
-# ----------------------------------------------------------------
-# DYNAMIQUE D'ENTRAÎNEMENT (gradients)
-# ----------------------------------------------------------------
 @torch.no_grad()
 def grad_norms(model):
-    """Norme L2 du gradient de chaque paramètre + norme globale, en une seule synchro GPU.
-
-    À appeler après backward() et AVANT un éventuel clipping : c'est la norme brute qui
-    révèle une explosion. `grad/total` est la valeur que clip_grad_norm_ renverrait.
-    """
+    """L2 norm of each parameter's gradient plus the global norm, measured before clipping."""
     named = [(n, p.grad.norm()) for n, p in model.named_parameters() if p.grad is not None]
     if not named:
         return {}
@@ -82,12 +54,7 @@ def grad_norms(model):
 
 @torch.no_grad()
 def update_ratios(model, before):
-    """||Δw|| / ||w|| par paramètre, entre avant et après optimizer.step().
-
-    Ordre de grandeur sain : ~1e-3. Bien en dessous, la couche n'apprend plus (lr trop
-    faible, gradients qui s'éteignent) ; bien au-dessus, les poids sont bousculés à
-    chaque pas (lr trop fort).
-    """
+    """||Δw|| / ||w|| per parameter across one optimizer step (healthy order of magnitude: 1e-3)."""
     names, ratios = [], []
     for n, p in model.named_parameters():
         if n in before:
@@ -96,32 +63,16 @@ def update_ratios(model, before):
     return {f"update_ratio/{n}": v for n, v in zip(names, torch.stack(ratios).tolist())}
 
 
-# Rampe ordinale bleue : clair = couche d'entrée, foncé = couche de sortie.
-_DEPTH_RAMP = ["#86b6ef", "#6da7ec", "#5598e7", "#3987e5", "#2a78d6",
-               "#256abf", "#1c5cab", "#184f95", "#104281", "#0d366b"]
-_INK, _MUTED, _GRID = "#52514e", "#898781", "#e1e0d9"
-
-
-def plot_training_dynamics(run_id, model=None):
-    """Normes de gradient et ratios de mise à jour d'un run, couche par couche.
-
-    Avec `model`, seuls les noyaux (conv / linear, ndim > 1) sont tracés : biais et
-    paramètres BatchNorm noieraient le graphe. Sans, tous les `.weight` logués.
-    Les courbes complètes, biais compris, restent dans MLflow (préfixes grad/ et update_ratio/).
-    """
+def plot_training_dynamics(run_id, model):
+    """Gradient norms and update ratios of a run, one line per conv / linear kernel."""
     client = mlflow.MlflowClient()
     run = client.get_run(run_id)
     keys = set(run.data.metrics)
     steps_per_epoch = float(run.data.params.get("steps_per_epoch", 1))
 
-    if model is not None:
-        layers = [n for n, p in model.named_parameters() if p.ndim > 1]
-    else:
-        layers = [k.split("/", 1)[1] for k in sorted(keys)
-                  if k.startswith("grad/") and k.endswith(".weight")]
-    layers = [n for n in layers if f"grad/{n}" in keys]
+    layers = [n for n, p in model.named_parameters() if p.ndim > 1 and f"grad/{n}" in keys]
     if not layers:
-        raise ValueError("Aucune métrique grad/* dans ce run (log_grads_every=0 ?)")
+        raise ValueError("No grad/* metrics in this run (log_grads_every=0?)")
 
     def history(key):
         h = sorted(client.get_metric_history(run_id, key), key=lambda m: m.step)
@@ -149,10 +100,10 @@ def plot_training_dynamics(run_id, model=None):
     if "train_loss_batch" in keys:
         ax_l.plot(*history("train_loss_batch"), color=single, lw=2)
 
-    panels = [(ax_g, "Norme du gradient par couche", True),
-              (ax_u, "Ratio de mise à jour ||Δw|| / ||w||", True),
-              (ax_t, "Norme globale du gradient (avant clipping)", True),
-              (ax_l, "Loss du batch", False)]
+    panels = [(ax_g, "Gradient norm per layer", True),
+              (ax_u, "Update ratio ||Δw|| / ||w||", True),
+              (ax_t, "Global gradient norm (before clipping)", True),
+              (ax_l, "Batch loss", False)]
     for ax, title, log in panels:
         ax.set_title(title, loc="left", color=_INK, fontsize=10)
         if log:
@@ -169,23 +120,19 @@ def plot_training_dynamics(run_id, model=None):
 
     handles, labels = ax_g.get_legend_handles_labels()
     fig.legend(handles, labels, loc="center left", bbox_to_anchor=(1.0, 0.5), frameon=False,
-               fontsize=8, title="couche (entrée → sortie)", title_fontsize=8)
+               fontsize=8, title="layer (input → output)", title_fontsize=8)
     fig.tight_layout()
-    # Fermée ici pour ne pas s'afficher en double ; le notebook l'affiche via le résultat.
+    # Closed so it is not displayed twice; the notebook shows it from the result.
     plt.close(fig)
     return fig
 
 
-# ----------------------------------------------------------------
-# BOUCLE D'ENTRAÎNEMENT
-# ----------------------------------------------------------------
 def train(model, criterion, optimizer, train_loader, val_loader=None, num_epochs=30,
-          device="cpu", scheduler=None, log_grads_every=50, grad_clip=None):
-    """Entraîne et recharge le meilleur état au sens du F1 macro de validation.
+          device="cpu", log_grads_every=50, grad_clip=None):
+    """Train, then restore the weights with the best validation macro F1.
 
-    `log_grads_every` : tous les combien de steps loguer normes de gradient, ratios de mise
-    à jour et loss du batch (0 / None pour couper). `grad_clip` : norme max des gradients,
-    None = pas de clipping.
+    Every `log_grads_every` steps (0 / None to disable), log gradient norms, update ratios
+    and the batch loss. `grad_clip` is the max gradient norm, None for no clipping.
     """
     best_f1, best_epoch, best_state = -1.0, -1, None
     step = 0
@@ -203,7 +150,6 @@ def train(model, criterion, optimizer, train_loader, val_loader=None, num_epochs
             optimizer.zero_grad()
             loss.backward()
 
-            # Pas à chaque step : ~50 métriques par écriture MLflow, et un clone des poids.
             monitor = bool(log_grads_every) and step % log_grads_every == 0
             if monitor:
                 step_metrics = {"train_loss_batch": loss.item(), **grad_norms(model)}
@@ -234,54 +180,31 @@ def train(model, criterion, optimizer, train_loader, val_loader=None, num_epochs
                 best_f1, best_epoch, best_state = val_f1, epoch, copy.deepcopy(model.state_dict())
                 msg += "  <- best"
 
-        # Le scheduler optionnel permet de tester des techniques de LR sans toucher à la boucle.
-        if scheduler is not None:
-            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(epoch_metrics.get("val_loss", train_loss))
-            else:
-                scheduler.step()
-
         log_metrics_if_active(epoch_metrics, step=epoch)
         print(msg)
 
     if best_state is not None:
         model.load_state_dict(best_state)
-        print(f"\nMeilleur modèle rechargé (epoch {best_epoch+1}, val_f1_macro = {best_f1:.4f})")
+        print(f"\nBest model restored (epoch {best_epoch+1}, val_f1_macro = {best_f1:.4f})")
         log_metrics_if_active({"best_val_f1_macro": best_f1, "best_epoch": best_epoch})
 
     return best_f1
 
 
-# ----------------------------------------------------------------
-# ÉVALUATION
-# ----------------------------------------------------------------
-def evaluate(model, loader, classes, device, split="test", dataframe=None):
-    """Évalue un modèle PyTorch sur un loader, via le code commun de scripts/evaluation.py.
-
-    `dataframe` doit être dans le même ordre que le loader (shuffle=False). Par défaut
-    on reprend `loader.dataset.dataframe` pour rattacher chaque prédiction à son image.
-    """
+def evaluate(model, loader, classes, device, split="test"):
+    """Evaluate a model on a non-shuffled loader whose dataset exposes `.dataframe`."""
     labels, _, probs, _ = predict(model, loader, device)
-    if dataframe is None:
-        dataframe = getattr(loader.dataset, "dataframe", None)
+    dataframe = getattr(loader.dataset, "dataframe", None)
     return evaluate_predictions(labels, probs, classes, split=split, dataframe=dataframe)
 
 
-# ----------------------------------------------------------------
-# LANCEMENT D'UN RUN COMPLET
-# ----------------------------------------------------------------
 def run_experiment(model, criterion, optimizer, train_loader, val_loader, test_loader, classes,
-                   experiment_name, run_name=None, num_epochs=15, device=None, scheduler=None,
-                   params=None, tags=None, log_model=True, log_split_files=True,
-                   log_grads_every=50, grad_clip=None):
-    """Un run MLflow = entraînement + évaluation test du meilleur modèle.
+                   experiment_name, run_name=None, num_epochs=15, device=None,
+                   params=None, tags=None, log_grads_every=50, grad_clip=None):
+    """One MLflow run: training, test evaluation of the best model, model and split logging.
 
-    `params` et `tags` sont ajoutés à ceux déduits automatiquement : y mettre tout ce
-    qui distingue la technique testée (augmentation, pondération, architecture...).
-    `log_grads_every` / `grad_clip` : voir `train`.
-
-    Renvoie le dict de `evaluate` enrichi de `run_id`, `best_val_f1` et, si les gradients
-    sont logués, `dynamics_figure`.
+    `params` / `tags` are added to the automatic ones. Returns the `evaluate` dict plus
+    `run_id`, `best_val_f1` and `dynamics_figure` (when gradients are logged).
     """
     if device is None:
         device = next(model.parameters()).device
@@ -298,7 +221,6 @@ def run_experiment(model, criterion, optimizer, train_loader, val_loader, test_l
             "lr": optimizer.param_groups[0]["lr"],
             "weight_decay": optimizer.param_groups[0].get("weight_decay", 0),
             "criterion": type(criterion).__name__,
-            "scheduler": type(scheduler).__name__ if scheduler is not None else "none",
             "batch_size_train": train_loader.batch_size,
             "batch_size_eval": test_loader.batch_size,
             "num_epochs": num_epochs,
@@ -306,18 +228,16 @@ def run_experiment(model, criterion, optimizer, train_loader, val_loader, test_l
             "grad_clip": grad_clip if grad_clip is not None else "none",
             "log_grads_every": log_grads_every or 0,
             "n_train": len(train_loader.dataset),
-            "n_val": len(val_loader.dataset) if val_loader is not None else 0,
+            "n_val": len(val_loader.dataset),
             "n_test": len(test_loader.dataset),
             "device": str(device),
         }
         mlflow.log_params({**auto_params, **(params or {})})
         mlflow.set_tags(tags or {})
-
-        if log_split_files:
-            log_splits()
+        log_splits()
 
         best_f1 = train(model, criterion, optimizer, train_loader, val_loader,
-                        num_epochs=num_epochs, device=device, scheduler=scheduler,
+                        num_epochs=num_epochs, device=device,
                         log_grads_every=log_grads_every, grad_clip=grad_clip)
 
         dynamics_fig = None
@@ -328,21 +248,20 @@ def run_experiment(model, criterion, optimizer, train_loader, val_loader, test_l
         print("\n===== TEST =====")
         result = evaluate(model, test_loader, classes, device, split="test")
 
-        if log_model:
-            # Copie CPU en pickle : rechargeable sans GPU, et embarque la classe du modèle.
-            model_cpu = copy.deepcopy(model).cpu().eval()
-            example = next(iter(test_loader))[0][:2].cpu().numpy()
-            with torch.no_grad():
-                example_out = model_cpu(torch.from_numpy(example)).numpy()
-            mlflow.pytorch.log_model(
-                model_cpu,
-                name="model",
-                signature=infer_signature(example, example_out),
-                serialization_format="pickle",
-            )
+        # CPU pickle: reloadable without a GPU and bundles the model class.
+        model_cpu = copy.deepcopy(model).cpu().eval()
+        example = next(iter(test_loader))[0][:2].cpu().numpy()
+        with torch.no_grad():
+            example_out = model_cpu(torch.from_numpy(example)).numpy()
+        mlflow.pytorch.log_model(
+            model_cpu,
+            name="model",
+            signature=infer_signature(example, example_out),
+            serialization_format="pickle",
+        )
 
-        print(f"\nRun MLflow : {run.info.run_id}")
-        print(f"Visualiser : mlflow ui --backend-store-uri \"{mlflow.get_tracking_uri()}\"")
+        print(f"\nMLflow run: {run.info.run_id}")
+        print(f"View with: mlflow ui --backend-store-uri \"{mlflow.get_tracking_uri()}\"")
 
     result["run_id"] = run.info.run_id
     result["best_val_f1"] = best_f1

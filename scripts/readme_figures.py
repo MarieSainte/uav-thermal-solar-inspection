@@ -1,14 +1,9 @@
-"""Figures du README (en anglais), régénérées depuis les runs MLflow existants.
+"""Regenerate the README figures from the logged MLflow runs (nothing is retrained).
 
-Rien n'est réentraîné : les prédictions viennent des artefacts `evaluation/predictions_test.csv`
-des runs, le modèle binaire est rechargé pour Grad-CAM et le test de robustesse.
-
-Usage :
+Usage:
     uv run python scripts/readme_figures.py
     uv run python scripts/readme_figures.py --binary-run <run_id> --out docs/figures
 """
-
-from __future__ import annotations
 
 import argparse
 import sys
@@ -29,24 +24,24 @@ from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score, roc_curve
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from evaluation import DATA_DIR, MLFLOW_DB, PROJECT_ROOT   # noqa: E402
-from explain import _overlay, compute_cam                  # noqa: E402
+from explain import cam_overlay, compute_cam              # noqa: E402
 
-# Runs analysés dans les notebooks (voir compare_runs).
+# Runs analysed in the notebooks.
 BINARY_RUN = "e3b730f6d7da4ca58cfe187e82ab38fb"       # simplecnn-binary-weighted-aug
 MULTI_RUN = "879e9e710b164088b94c34bad8ebeebd"        # simplecnn-weighted-aug (12 classes)
 PATCHCORE_RUN = "839ba7c402e7433eba615ddd4d9d2556"    # patchcore-autoencoder-pca64-core0.1
 
-# Palette de référence (validée daltonisme) : série 1 = bleu, série 2 = orange.
+# Colour-blind safe reference palette: series 1 = blue, series 2 = orange.
 SURFACE, INK, INK_2, MUTED = "#fcfcfb", "#0b0b0b", "#52514e", "#898781"
 GRID, BASELINE = "#e1e0d9", "#c3c2b7"
 BLUE, ORANGE = "#2a78d6", "#eb6834"
-# Rampe séquentielle bleue, du quasi-surface (≈ 0) au plus foncé.
+# Sequential blue ramp, from the surface colour (≈ 0) to the darkest step.
 SEQ = LinearSegmentedColormap.from_list(
     "seq_blue", [SURFACE, "#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b"])
 
 
 class SimpleCNN(nn.Module):
-    """Même définition que les notebooks : le pickle MLflow référence __main__.SimpleCNN."""
+    """Same definition as the notebooks: the MLflow pickle references __main__.SimpleCNN."""
 
     def __init__(self, n_classes=12, in_ch=1):
         super().__init__()
@@ -86,11 +81,11 @@ def save(fig, out_dir, name):
     path = out_dir / name
     fig.savefig(path, dpi=160, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
-    print(f"  {path.relative_to(PROJECT_ROOT)}")
+    print(f"  {path.name}")
 
 
 def wrap(cls):
-    """Coupe les noms longs au dernier tiret : « Hot-Spot- / Multi »."""
+    """Break long class names at the last hyphen."""
     head, _, tail = cls.rpartition("-")
     return f"{head}-\n{tail}" if len(cls) > 10 and head else cls
 
@@ -108,8 +103,8 @@ def predictions(run_id):
 # FIGURES
 # ----------------------------------------------------------------
 def class_gallery(multi, out_dir, per_class=3):
-    """Exemples typiques de chaque classe : les plus sûrs pour le modèle multi-classes."""
-    classes = multi["label"].value_counts().index.tolist()   # de la plus fréquente à la plus rare
+    """Most confident correct examples of each class (12-class model)."""
+    classes = multi["label"].value_counts().index.tolist()
     fig, axes = plt.subplots(per_class, len(classes), figsize=(1.05 * len(classes), 1.75 * per_class + 0.4))
     for j, cls in enumerate(classes):
         best = multi[(multi["label"] == cls) & multi["correct"]].nlargest(per_class, "prob_true")
@@ -127,7 +122,7 @@ def class_gallery(multi, out_dir, per_class=3):
 
 
 def binary_results(cnn, patchcore, out_dir):
-    """Matrice de confusion du CNN + courbes ROC CNN vs PatchCore sur le même test."""
+    """CNN confusion matrix and ROC curves of the CNN vs PatchCore on the same test set."""
     fig, (ax_cm, ax_roc) = plt.subplots(1, 2, figsize=(10, 4.3), gridspec_kw={"width_ratios": [1, 1.15]})
 
     classes = ["No-Anomaly", "Anomaly"]
@@ -160,7 +155,7 @@ def binary_results(cnn, patchcore, out_dir):
 
 
 def recall_by_type(cnn, patchcore, out_dir):
-    """Rappel par type d'anomalie d'origine : quels défauts passent pour du sain ?"""
+    """Recall per original anomaly type for both binary models."""
     def recall(df):
         a = df[df["label"] == "Anomaly"]
         return a.groupby("label_orig")["correct"].agg(["mean", "size"])
@@ -173,7 +168,7 @@ def recall_by_type(cnn, patchcore, out_dir):
     ax.hlines(y, r_cnn.loc[order, "mean"], r_pc.loc[order, "mean"], color=BASELINE, lw=2, zorder=1)
     for r, other_r, color, name in [(r_cnn, r_pc, BLUE, "Custom CNN"), (r_pc, r_cnn, ORANGE, "PatchCore")]:
         v = r.loc[order, "mean"].values
-        # Libellé du côté extérieur de l'écart pour ne pas chevaucher l'autre point.
+        # Label on the outer side of the gap so it never overlaps the other dot.
         other = other_r.loc[order, "mean"].values
         ax.scatter(v, y, s=70, color=color, edgecolor=SURFACE, linewidth=2, zorder=3, label=name)
         for yi, vi, oi in zip(y, v, other):
@@ -194,7 +189,7 @@ def recall_by_type(cnn, patchcore, out_dir):
 
 
 def multiclass_confusion(multi, out_dir):
-    """Matrice 12×12 normalisée par classe réelle ; seules les cases ≥ 5 % sont chiffrées."""
+    """Row-normalised 12×12 confusion matrix; only cells ≥ 5% are labelled."""
     classes = sorted(multi["label"].unique())
     cm = confusion_matrix(multi["label"], multi["pred_label"], labels=classes)
     cm_norm = cm / cm.sum(1, keepdims=True)
@@ -220,7 +215,7 @@ def multiclass_confusion(multi, out_dir):
 
 
 def gradcam_examples(model, cnn, device, out_dir):
-    """Une anomalie bien détectée par type : image thermique, puis zone qui pousse vers « Anomaly »."""
+    """One correctly detected anomaly per type: thermal image, then Grad-CAM for "Anomaly"."""
     picks = (cnn[cnn["correct"] & (cnn["label"] == "Anomaly")]
              .sort_values("confidence", ascending=False).groupby("label_orig").head(1)
              .sort_values("label_orig"))
@@ -232,7 +227,7 @@ def gradcam_examples(model, cnn, device, out_dir):
     for j, (img, cam, cls) in enumerate(zip(imgs, cams, picks["label_orig"])):
         axes[0, j].imshow(img, cmap="inferno", vmin=0, vmax=255)
         axes[1, j].imshow(img, cmap="gray", vmin=0, vmax=255)
-        axes[1, j].imshow(_overlay(cam))
+        axes[1, j].imshow(cam_overlay(cam))
         axes[0, j].set_title(wrap(cls), fontsize=8, loc="center", fontweight="normal", color=INK_2)
         for ax in axes[:, j]:
             ax.set_xticks([]); ax.set_yticks([])
@@ -247,10 +242,10 @@ def gradcam_examples(model, cnn, device, out_dir):
 
 
 def label_issues(out_dir, n=10):
-    """Candidats cleanlab les plus suspects, dans les deux sens."""
+    """Most suspicious cleanlab candidates, in both directions."""
     path = DATA_DIR / "label_issues_binary.csv"
     if not path.exists():
-        print("  (label_issues_binary.csv absent : lancer la partie cleanlab de custom_cnn_binary)")
+        print("  (label_issues_binary.csv not found: run the cleanlab part of custom_cnn_binary)")
         return
     issues = pd.read_csv(path).sort_values("label_quality")
     rows = [("Labelled No-Anomaly, model is confident it is an anomaly",
@@ -258,7 +253,6 @@ def label_issues(out_dir, n=10):
             ("Labelled as an anomaly, model sees a healthy module",
              issues[issues["given_label"] == "Anomaly"].head(n))]
 
-    # Une sous-figure par sens d'erreur : chaque ligne garde son propre titre.
     fig = plt.figure(figsize=(1.1 * n, 5.4), layout="constrained")
     for sub, (title, df) in zip(fig.subfigures(2, 1, hspace=0.06), rows):
         axes = sub.subplots(1, n)
@@ -275,10 +269,10 @@ def label_issues(out_dir, n=10):
 
 
 def intensity_robustness(model, device, out_dir):
-    """F1 du CNN binaire quand on décale la luminosité ou le contraste du test.
+    """Binary CNN F1 when the test images are shifted in brightness or contrast.
 
-    En thermographie non radiométrique, le niveau de gris dépend du réglage de la caméra :
-    un modèle robuste ne devrait pas bouger. Les deux grandeurs restent sur deux axes séparés.
+    In non-radiometric thermal images the grey level depends on the camera settings,
+    so a robust model should not move.
     """
     test = pd.read_csv(DATA_DIR / "test.csv")
     X = np.stack([load_image(p) for p in test["filepath"]]).astype(np.float32)
@@ -348,8 +342,8 @@ def main(argv=None):
     gradcam_examples(model, cnn, device, args.out)
     label_issues(args.out)
     shift, contrast = intensity_robustness(model, device, args.out)
-    print("F1 vs luminosité :", {int(k): round(v, 4) for k, v in shift.items()})
-    print("F1 vs contraste  :", {float(k): round(v, 4) for k, v in contrast.items()})
+    print("F1 vs brightness:", {int(k): round(v, 4) for k, v in shift.items()})
+    print("F1 vs contrast:  ", {float(k): round(v, 4) for k, v in contrast.items()})
     return 0
 
 

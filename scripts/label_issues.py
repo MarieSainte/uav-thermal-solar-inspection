@@ -1,25 +1,8 @@
-"""Détection d'erreurs de label avec cleanlab, à partir de probabilités hors échantillon.
+"""Label-error detection with cleanlab, from out-of-fold predicted probabilities.
 
-cleanlab compare le label donné à ce que prédit un modèle qui n'a PAS vu l'image : une
-image dont le label reçoit une proba très faible, alors que le modèle est sûr d'une autre
-classe, est suspecte. Les probas doivent donc être hors échantillon — celles d'un modèle
-sur son propre train sont sur-apprises et cachent justement les labels faux qu'il a mémorisés.
-
-Deux sources de probas :
-  - les prédictions test d'un run (déjà hors échantillon) : immédiat, mais ne couvre que le test ;
-  - `cross_val_pred_probs` : K modèles, chacun prédit le pli qu'il n'a pas vu -> une proba
-    hors échantillon pour CHAQUE image. Les plis respectent les groupes de similarité :
-    sinon un quasi-doublon resté dans le train "souffle" son label (même faux) au pli prédit.
-
-Usage depuis un notebook de notebook/ :
-    from label_issues import cross_val_pred_probs, find_label_issues_df
-
-    oof_probs, folds = cross_val_pred_probs(all_df, make_model, make_optimizer, criterion, make_loader)
-    issues = find_label_issues_df(all_df["label"].map(label2idx), oof_probs, classes, df=all_df)
-    issues[issues["is_label_issue"]]
+A model's probabilities on its own training set are overfitted and confirm the wrong labels
+it memorised, so every image must be predicted by a model that has not seen it.
 """
-
-from __future__ import annotations
 
 import math
 import os
@@ -41,25 +24,19 @@ from sklearn.model_selection import StratifiedGroupKFold
 from evaluation import evaluate_predictions, setup_mlflow
 from train import predict, train
 
-_INK, _MUTED = "#52514e", "#898781"
+_INK = "#52514e"
 META_COLS = ("id", "filepath", "split", "label_orig", "similarity_group")
 
 
-# ----------------------------------------------------------------
-# PROBAS HORS ÉCHANTILLON (validation croisée)
-# ----------------------------------------------------------------
 def cross_val_pred_probs(df, make_model, make_optimizer, criterion, make_loader, n_splits=5,
-                         num_epochs=20, group_col="similarity_group", stratify_col="label",
-                         device=None, seed=0):
-    """Probas out-of-fold (N, n_classes) pour chaque ligne de `df`, et le pli de chacune.
+                         num_epochs=20, stratify_col="label", device=None, seed=0):
+    """Out-of-fold probabilities (N, n_classes) for every row of `df`, and the fold of each row.
 
-    make_model()             -> nn.Module neuf (non entraîné)
-    make_optimizer(model)    -> optimiseur
-    make_loader(df, train)   -> DataLoader ; train=True : augmentation + shuffle,
-                                train=False : sans augmentation, shuffle=False (ordre conservé)
-
-    Nombre d'epochs fixe, sans sélection sur le pli prédit : choisir la meilleure epoch
-    avec les labels qu'on soupçonne biaiserait justement l'analyse.
+    make_model() returns a fresh model, make_optimizer(model) its optimizer, and
+    make_loader(df, train) a DataLoader (train=False: no augmentation, order kept).
+    Folds keep similarity groups together, otherwise a near-duplicate left in training leaks
+    its (possibly wrong) label. The epoch count is fixed: picking the best epoch with the
+    suspected labels would bias the analysis.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -67,8 +44,8 @@ def cross_val_pred_probs(df, make_model, make_optimizer, criterion, make_loader,
     sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     probs, folds = None, np.full(len(df), -1)
 
-    for k, (tr_idx, ho_idx) in enumerate(sgkf.split(df, y=df[stratify_col], groups=df[group_col])):
-        print(f"\n===== Pli {k + 1}/{n_splits} : entraînement {len(tr_idx)} | prédit {len(ho_idx)} =====")
+    for k, (tr_idx, ho_idx) in enumerate(sgkf.split(df, y=df[stratify_col], groups=df["similarity_group"])):
+        print(f"\n===== Fold {k + 1}/{n_splits}: train {len(tr_idx)} | predict {len(ho_idx)} =====")
         torch.manual_seed(seed + k)
         model = make_model().to(device)
         optimizer = make_optimizer(model)
@@ -82,28 +59,22 @@ def cross_val_pred_probs(df, make_model, make_optimizer, criterion, make_loader,
     return probs, folds
 
 
-# ----------------------------------------------------------------
-# DÉTECTION
-# ----------------------------------------------------------------
-def find_label_issues_df(labels, pred_probs, classes, df=None, method="self_confidence"):
-    """Une ligne par image, triée de la plus suspecte à la moins suspecte (index = position dans df).
+def find_label_issues_df(labels, pred_probs, classes, df=None):
+    """One row per image, most suspicious first (index = position in `df`).
 
-    - label_quality   : score cleanlab dans [0, 1], bas = suspect (self_confidence = proba du
-                        label donné ; "normalized_margin" pénalise aussi une autre classe très sûre)
-    - is_label_issue  : sélection cleanlab (prune_by_noise_rate). Le NOMBRE d'erreurs est estimé
-                        par la matrice « label donné × vraie classe » (confident joint), pas par
-                        un seuil arbitraire ; on retire ensuite les plus suspectes de chaque case.
-    - suggested_label : classe la plus probable selon le modèle
+    label_quality is cleanlab's self-confidence score (low = suspicious). is_label_issue uses
+    prune_by_noise_rate: the number of issues is estimated from the confident joint, not from
+    an arbitrary threshold.
     """
     labels = np.asarray(labels).astype(int)
     pred_probs = np.asarray(pred_probs, dtype=np.float32)
-    # n_jobs=1 : le multiprocessing de cleanlab est fragile sous Windows / Jupyter.
+    # n_jobs=1: cleanlab multiprocessing is fragile on Windows / Jupyter.
     is_issue = find_label_issues(labels, pred_probs, filter_by="prune_by_noise_rate", n_jobs=1)
     out = pd.DataFrame({
         "given_label": [classes[i] for i in labels],
         "suggested_label": [classes[i] for i in pred_probs.argmax(1)],
         "prob_given": pred_probs[np.arange(len(labels)), labels],
-        "label_quality": get_label_quality_scores(labels, pred_probs, method=method),
+        "label_quality": get_label_quality_scores(labels, pred_probs, method="self_confidence"),
         "is_label_issue": is_issue,
     })
     if df is not None:
@@ -113,24 +84,18 @@ def find_label_issues_df(labels, pred_probs, classes, df=None, method="self_conf
 
 
 def label_noise_summary(labels, pred_probs, classes):
-    """Score de santé global, matrice jointe estimée et bruit par classe.
-
-    joint[i, j] = part estimée du dataset labellisée i alors que la vraie classe est j.
-    Hors diagonale = erreurs de label estimées, dans chaque sens.
-    """
+    """Overall health score, estimated joint (given label × true class) and per-class quality."""
     labels = np.asarray(labels).astype(int)
     health = overall_label_health_score(labels, pred_probs, verbose=False)
     joint = pd.DataFrame(estimate_joint(labels, pred_probs),
-                         index=[f"donné : {c}" for c in classes], columns=[f"vrai : {c}" for c in classes])
+                         index=[f"given: {c}" for c in classes], columns=[f"true: {c}" for c in classes])
     per_class = rank_classes_by_label_quality(labels, pred_probs, class_names=classes)
     return health, joint, per_class
 
 
-# ----------------------------------------------------------------
-# VISUALISATION
-# ----------------------------------------------------------------
-def show_issues(issues, n=30, ncols=10, title=""):
-    """Grille des images suspectes : label donné (et type d'origine), avis du modèle, qualité."""
+def show_issues(issues, n=30, title=""):
+    """Grid of suspicious images: given label (and original type), model suggestion, quality."""
+    ncols = 10
     rows = issues.head(n)
     if rows.empty:
         return None
@@ -141,7 +106,7 @@ def show_issues(issues, n=30, ncols=10, title=""):
         lines = [r["given_label"]]
         if "label_orig" in r and r["label_orig"] != r["given_label"]:
             lines.append(f"({r['label_orig']})")
-        lines += [f"→ {r['suggested_label']}", f"qualité {r['label_quality']:.3f}"]
+        lines += [f"→ {r['suggested_label']}", f"quality {r['label_quality']:.3f}"]
         ax.set_title("\n".join(lines), fontsize=7, color=_INK)
     for ax in axes.flat:
         ax.set_xticks([])
@@ -150,19 +115,15 @@ def show_issues(issues, n=30, ncols=10, title=""):
             spine.set_visible(False)
     for ax in axes.flat[len(rows):]:
         ax.axis("off")
-    fig.suptitle(f"{title}\nlabel donné → classe suggérée par le modèle".strip(), fontsize=10, color=_INK)
+    fig.suptitle(f"{title}\ngiven label → model suggestion".strip(), fontsize=10, color=_INK)
     fig.tight_layout()
     plt.close(fig)
     return fig
 
 
-# ----------------------------------------------------------------
-# MLFLOW / FIFTYONE
-# ----------------------------------------------------------------
 def log_label_issues(issues, labels, pred_probs, classes, experiment_name, run_name=None,
                      params=None, dataframe=None, figures=None):
-    """Run MLflow de l'analyse : métriques out-of-fold (mêmes noms que les autres runs, préfixe
-    oof_), nombre d'erreurs suspectées, table complète et probas en artefacts."""
+    """MLflow run of the analysis: out-of-fold metrics (oof_ prefix), issue counts, tables."""
     setup_mlflow(experiment_name)
     health, joint, per_class = label_noise_summary(labels, pred_probs, classes)
     with mlflow.start_run(run_name=run_name) as run:
@@ -184,36 +145,32 @@ def log_label_issues(issues, labels, pred_probs, classes, experiment_name, run_n
         for path, fig in (figures or {}).items():
             if fig is not None:
                 mlflow.log_figure(fig, path)
-        print(f"\nRun MLflow : {run.info.run_id}")
+        print(f"\nMLflow run: {run.info.run_id}")
     return run.info.run_id
 
 
 def _path_key(p):
-    """Chemin comparable d'une machine / d'un cwd à l'autre (casse du lecteur, séparateurs)."""
     return os.path.normcase(os.path.abspath(str(p)))
 
 
 def tag_fiftyone(issues, dataset_name="InfraredSolar", tag="label_issue"):
-    """Marque les suspects dans FiftyOne pour la revue visuelle, et ajoute à toutes les images
-    analysées les champs `label_quality` et `cleanlab_suggested`.
+    """Tag the suspects in FiftyOne and add `label_quality` / `cleanlab_suggested` fields.
 
-    Correspondance par chemin de fichier et non par `id` : les ids FiftyOne changent dès que
-    le dataset est reconstruit (relance de l'EDA), les chemins non.
-    Le tag est d'abord retiré partout, pour qu'un nouveau passage remplace l'ancien.
-    Renvoie la vue des suspects triée par qualité croissante (à ouvrir avec fo.launch_app).
+    Samples are matched by file path because FiftyOne ids change when the dataset is rebuilt.
+    Returns the suspects view, lowest quality first.
     """
-    import fiftyone as fo  # import local : lent à charger, inutile sans revue
+    import fiftyone as fo  # local import: slow to load, only needed for the review
 
     ds = fo.load_dataset(dataset_name)
     if not ds.persistent:
-        print(f"Attention : '{dataset_name}' n'est pas persistant. FiftyOne le supprime au prochain "
-              "démarrage sans autre session ouverte, tags compris (dataset.persistent = True pour le garder).")
+        print(f"Warning: '{dataset_name}' is not persistent, FiftyOne will delete it (and the tags) "
+              "on the next start without another session. Set dataset.persistent = True to keep it.")
 
     id_by_path = {_path_key(p): i for p, i in zip(*ds.values(["filepath", "id"]))}
     sample_ids = issues["filepath"].map(lambda p: id_by_path.get(_path_key(p)))
     found = sample_ids.notna()
     if (~found).any():
-        print(f"{(~found).sum()} images introuvables dans '{dataset_name}' (ignorées).")
+        print(f"{(~found).sum()} images not found in '{dataset_name}' (skipped).")
     issues, sample_ids = issues[found], sample_ids[found]
 
     ds.untag_samples(tag)

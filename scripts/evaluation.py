@@ -1,34 +1,8 @@
-"""Évaluation commune à tous les modèles, suivie dans MLflow.
+"""Metrics, thresholding and MLflow logging shared by every model of the project.
 
-Un seul code de métriques pour tout le projet : scripts/train.py l'appelle après
-l'entraînement, et un modèle custom (ex. détection d'anomalie type PatchCore) l'appelle
-directement avec ses propres sorties. Les métriques et artefacts portent les mêmes noms
-dans les deux cas, donc les runs restent comparables dans MLflow.
-
-Deux formats de sortie acceptés :
-  - `probs` en 2D (n, n_classes) : probabilités, la prédiction est l'argmax ;
-  - `probs` en 1D (n,) : score de la classe positive classes[1] (binaire uniquement),
-    prédiction = score >= threshold. Le score n'a pas besoin d'être dans [0, 1].
-
-Usage depuis un notebook de notebook/ :
-    import sys; sys.path.insert(0, "../scripts")
-    from evaluation import find_threshold, run_evaluation
-
-    # Seuil choisi sur la validation, jamais sur le test
-    threshold = find_threshold(val_labels, val_scores)
-
-    result = run_evaluation(
-        test_labels, test_scores,
-        classes=["No-Anomaly", "Anomaly"],
-        experiment_name="infrared-solar-custom-cnn-binary",
-        run_name="patchcore-wrn50",
-        threshold=threshold,
-        dataframe=test,
-        params={"backbone": "wide_resnet50_2"},
-    )
+`probs` can be 2D (n, n_classes) probabilities, predicted with argmax, or 1D scores of the
+positive class classes[1] (binary only), predicted with `score >= threshold`.
 """
-
-from __future__ import annotations
 
 import tempfile
 from pathlib import Path
@@ -47,65 +21,48 @@ MLFLOW_DB = (PROJECT_ROOT / "mlflow.db").as_posix()
 MLFLOW_ARTIFACTS = (PROJECT_ROOT / "mlartifacts").as_posix()
 
 
-# ----------------------------------------------------------------
-# CONFIGURATION MLFLOW
-# ----------------------------------------------------------------
-def setup_mlflow(experiment_name: str) -> str:
-    """Pointe MLflow sur le SQLite du projet et active l'expérience (créée si besoin).
-
-    Chemins résolus depuis ce fichier et non depuis le cwd : le script marche pareil
-    lancé depuis notebook/ ou depuis la racine.
-    """
+def setup_mlflow(experiment_name):
+    """Point MLflow at the project SQLite store and activate the experiment (created if needed)."""
     mlflow.set_tracking_uri(f"sqlite:///{MLFLOW_DB}")
     if mlflow.get_experiment_by_name(experiment_name) is None:
         mlflow.create_experiment(experiment_name, artifact_location=f"file:///{MLFLOW_ARTIFACTS}")
     mlflow.set_experiment(experiment_name)
-    return mlflow.get_tracking_uri()
 
 
 def log_metrics_if_active(metrics, step=None):
-    """Logue uniquement s'il y a un run ouvert, pour pouvoir appeler les fonctions hors MLflow."""
     if mlflow.active_run() is not None:
         mlflow.log_metrics(metrics, step=step)
 
 
 def log_splits():
-    """Joint les CSV de split au run, pour rejouer exactement le même découpage plus tard."""
-    for nom in ("train", "val", "test"):
-        path = DATA_DIR / f"{nom}.csv"
+    """Attach the split CSVs to the active run, so the exact split can be replayed."""
+    for name in ("train", "val", "test"):
+        path = DATA_DIR / f"{name}.csv"
         if path.exists():
             mlflow.log_artifact(str(path), artifact_path="splits")
 
 
-# ----------------------------------------------------------------
-# SEUIL (sorties en score)
-# ----------------------------------------------------------------
 def find_threshold(labels, scores):
-    """Seuil qui maximise le F1 de la classe positive. À calculer sur la validation."""
+    """Threshold maximising the positive-class F1. Compute it on validation, never on test."""
     precision, recall, thresholds = precision_recall_curve(labels, scores)
     f1 = 2 * precision * recall / np.clip(precision + recall, 1e-12, None)
-    # La dernière paire precision/recall n'a pas de seuil associé.
+    # The last precision/recall pair has no threshold.
     return float(thresholds[np.argmax(f1[:-1])])
 
 
-# ----------------------------------------------------------------
-# MÉTRIQUES
-# ----------------------------------------------------------------
 def evaluate_predictions(labels, probs, classes, split="test", dataframe=None, threshold=0.5):
-    """Métriques, matrice de confusion, AUC ROC et table des prédictions d'un split.
+    """Metrics, confusion matrix, ROC AUC and per-image predictions for one split.
 
-    `dataframe` doit être dans le même ordre que `labels` : il sert à rattacher chaque
-    prédiction à son image (colonnes id, filepath, label_orig si présentes).
-    Si un run MLflow est ouvert, métriques et artefacts y sont loggés.
+    `dataframe` must follow the order of `labels`; its id / filepath / label_orig columns are
+    copied into the predictions. Metrics and artifacts are logged if an MLflow run is active.
     """
     labels = np.asarray(labels).astype(int)
     probs = np.asarray(probs, dtype=float)
     n_classes = len(classes)
     scores_mode = probs.ndim == 1
     if scores_mode and n_classes != 2:
-        raise ValueError("Un score 1D n'a de sens qu'en binaire (classes[1] = classe positive).")
+        raise ValueError("1D scores are only supported for binary tasks (classes[1] = positive).")
 
-    # Score de la classe positive en binaire (1D fourni directement, ou colonne 1 des probas).
     pos_scores = probs if scores_mode else (probs[:, 1] if n_classes == 2 else None)
     preds = (pos_scores >= threshold).astype(int) if scores_mode else probs.argmax(1)
 
@@ -115,10 +72,6 @@ def evaluate_predictions(labels, probs, classes, split="test", dataframe=None, t
         f"{split}_f1_weighted": f1_score(labels, preds, average="weighted"),
     }
 
-    # ===== AUC ROC =====
-    # Multi-classes : global en one-vs-rest macro, plus une AUC par classe (les rares se
-    # noient dans la moyenne). Binaire : AUC classique sur le score de la classe positive,
-    # qui est classes[1] — à ordonner en conséquence dans le notebook.
     roc_auc = {"global": None, "per_class": {}}
     try:
         if n_classes == 2:
@@ -129,7 +82,7 @@ def evaluate_predictions(labels, probs, classes, split="test", dataframe=None, t
                                               labels=list(range(n_classes)))
             metrics[f"{split}_roc_auc_ovr"] = roc_auc["global"]
     except ValueError as e:
-        print(f"ROC AUC : non calculable ({e})")
+        print(f"ROC AUC: not computable ({e})")
 
     if n_classes == 2:
         pos = classes[1]
@@ -140,11 +93,9 @@ def evaluate_predictions(labels, probs, classes, split="test", dataframe=None, t
 
     for i, cls in enumerate(classes):
         y_bin = (labels == i).astype(int)
-        # Une classe absente du split n'a pas d'AUC définie.
         if not 0 < y_bin.sum() < len(y_bin):
             continue
         if n_classes == 2:
-            # En binaire, l'AUC de la classe négative est la même que celle de la positive.
             roc_auc["per_class"][cls] = roc_auc["global"]
         else:
             roc_auc["per_class"][cls] = roc_auc_score(y_bin, probs[:, i])
@@ -165,8 +116,6 @@ def evaluate_predictions(labels, probs, classes, split="test", dataframe=None, t
     print()
     print(txt_report)
 
-    # ===== Matrice de confusion =====
-    # Brute (effectifs) renvoyée pour l'analyse, normalisée par ligne pour la figure.
     cm = confusion_matrix(labels, preds, labels=list(range(n_classes)))
     cm_df = pd.DataFrame(cm, index=classes, columns=classes)
     cm_df.index.name, cm_df.columns.name = "true", "pred"
@@ -176,11 +125,9 @@ def evaluate_predictions(labels, probs, classes, split="test", dataframe=None, t
     ConfusionMatrixDisplay(cm_norm, display_labels=classes).plot(
         ax=ax, cmap="Blues", xticks_rotation=90, values_format=".2f", colorbar=False
     )
-    ax.set_title(f"Matrice de confusion — {split} (normalisée par classe réelle)")
+    ax.set_title(f"Confusion matrix, {split} (normalised by true class)")
     fig.tight_layout()
 
-    # ===== Prédictions =====
-    # Une ligne par image : de quoi filtrer les bons / mauvais et regarder les images.
     predictions = pd.DataFrame({
         "y_true": labels,
         "y_pred": preds,
@@ -188,7 +135,6 @@ def evaluate_predictions(labels, probs, classes, split="test", dataframe=None, t
         "pred_label": [classes[i] for i in preds],
     })
     if scores_mode:
-        # Score brut : pas une proba, donc pas de "confidence" ni de prob_* par classe.
         predictions["score"] = pos_scores
         predictions["correct"] = predictions["y_true"] == predictions["y_pred"]
     else:
@@ -199,7 +145,6 @@ def evaluate_predictions(labels, probs, classes, split="test", dataframe=None, t
         predictions = pd.concat([predictions, probs_df], axis=1)
 
     if dataframe is not None and len(dataframe) == len(predictions):
-        # label_orig : classe d'origine quand les labels ont été regroupés (cas binaire).
         meta_cols = [c for c in ("id", "filepath", "label_orig") if c in dataframe]
         meta = dataframe.reset_index(drop=True)[meta_cols]
         predictions = pd.concat([meta, predictions], axis=1)
@@ -215,7 +160,7 @@ def evaluate_predictions(labels, probs, classes, split="test", dataframe=None, t
             for f in tmp.iterdir():
                 mlflow.log_artifact(str(f), artifact_path="evaluation")
 
-    # Fermée ici pour ne pas s'afficher en double ; le notebook l'affiche via result["figure"].
+    # Closed so it is not displayed twice; the notebook shows result["figure"].
     plt.close(fig)
 
     return {
@@ -228,50 +173,44 @@ def evaluate_predictions(labels, probs, classes, split="test", dataframe=None, t
     }
 
 
-# ----------------------------------------------------------------
-# LANCEMENT D'UN RUN D'ÉVALUATION SEUL
-# ----------------------------------------------------------------
-def run_evaluation(labels, probs, classes, experiment_name, run_name=None, split="test",
-                   dataframe=None, threshold=0.5, params=None, tags=None, log_split_files=True,
-                   extra_metrics=None):
-    """Un run MLflow d'évaluation pour un modèle entraîné ailleurs (ex. PatchCore custom).
+def run_evaluation(labels, probs, classes, experiment_name, run_name=None,
+                   dataframe=None, threshold=0.5, params=None, tags=None, extra_metrics=None):
+    """MLflow test-evaluation run for a model trained elsewhere (e.g. PatchCore).
 
-    `params` / `tags` : tout ce qui décrit la technique. `extra_metrics` : métriques propres
-    au modèle (ex. temps d'inférence, taille de la memory bank) loggées telles quelles.
-    Renvoie le dict de `evaluate_predictions` enrichi de `run_id`.
+    `extra_metrics` are model-specific values logged as is (inference time, memory bank size...).
     """
     setup_mlflow(experiment_name)
 
     with mlflow.start_run(run_name=run_name) as run:
         mlflow.log_params({
             "n_classes": len(classes),
-            f"n_{split}": len(labels),
+            "n_test": len(labels),
             "output": "score" if np.asarray(probs).ndim == 1 else "probs",
             **(params or {}),
         })
         mlflow.set_tags(tags or {})
-        if log_split_files:
-            log_splits()
+        log_splits()
         if extra_metrics:
             mlflow.log_metrics(extra_metrics)
 
-        print(f"===== {split.upper()} =====")
-        result = evaluate_predictions(labels, probs, classes, split=split,
+        print("===== TEST =====")
+        result = evaluate_predictions(labels, probs, classes, split="test",
                                       dataframe=dataframe, threshold=threshold)
 
-        print(f"\nRun MLflow : {run.info.run_id}")
-        print(f"Visualiser : mlflow ui --backend-store-uri \"{mlflow.get_tracking_uri()}\"")
+        print(f"\nMLflow run: {run.info.run_id}")
+        print(f"View with: mlflow ui --backend-store-uri \"{mlflow.get_tracking_uri()}\"")
 
     result["run_id"] = run.info.run_id
     return result
 
 
-def compare_runs(experiment_name, order_by="metrics.test_f1_macro DESC"):
-    """Historique des runs d'une expérience, trié, pour comparer les techniques."""
+def compare_runs(experiment_name):
+    """Runs of an experiment, best test macro F1 first."""
     setup_mlflow(experiment_name)
-    runs = mlflow.search_runs(experiment_names=[experiment_name], order_by=[order_by])
-    colonnes = ["run_id", "tags.mlflow.runName", "metrics.best_val_f1_macro",
-                "metrics.test_f1_macro", "metrics.test_roc_auc_ovr", "metrics.test_roc_auc",
-                "metrics.test_accuracy", "params.model", "params.lr", "params.num_epochs",
-                "start_time"]
-    return runs[[c for c in colonnes if c in runs.columns]]
+    runs = mlflow.search_runs(experiment_names=[experiment_name],
+                              order_by=["metrics.test_f1_macro DESC"])
+    columns = ["run_id", "tags.mlflow.runName", "metrics.best_val_f1_macro",
+               "metrics.test_f1_macro", "metrics.test_roc_auc_ovr", "metrics.test_roc_auc",
+               "metrics.test_accuracy", "params.model", "params.lr", "params.num_epochs",
+               "start_time"]
+    return runs[[c for c in columns if c in runs.columns]]

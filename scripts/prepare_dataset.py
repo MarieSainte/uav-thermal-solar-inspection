@@ -1,17 +1,12 @@
-"""Construction des splits train / val / test pour le dataset infrarouge.
+"""Build the train / val / test splits from data/dataset_eda.csv.
 
-Lit data/dataset_eda.csv et écrit data/train.csv, data/val.csv et data/test.csv.
+Similarity groups never cross two splits (no leakage) and the proportions of the 12 classes
+are kept in every split.
 
-Le découpage respecte deux contraintes en même temps :
-  - les groupes de similarité ne sont jamais coupés entre deux splits (pas de fuite) ;
-  - les proportions des 12 classes sont conservées dans chaque split (stratification).
-
-Usage :
+Usage:
     uv run python scripts/prepare_dataset.py
     uv run python scripts/prepare_dataset.py --seed 7 --n-splits-test 4
 """
-
-from __future__ import annotations
 
 import argparse
 import sys
@@ -27,125 +22,100 @@ SOURCE_CSV = DATA_DIR / "dataset_eda.csv"
 SPLIT_FILES = {"train": "train.csv", "val": "val.csv", "test": "test.csv"}
 
 
-def assigner_groupes_uniques(df: pd.DataFrame) -> pd.DataFrame:
-    """Donne un groupe propre à chaque image sans groupe de similarité.
+def assign_singleton_groups(df):
+    """Give each image without a similarity group its own group.
 
-    Sans ça, toutes les images isolées partageraient le groupe NaN et finiraient
-    forcément dans le même split.
+    Otherwise all isolated images would share the NaN group and land in the same split.
     """
     out = df.copy()
     out["similarity_group"] = out["similarity_group"].astype("string")
-
-    isolees = out["similarity_group"].isna()
-    out.loc[isolees, "similarity_group"] = "single_" + out.index[isolees].astype(str)
-
-    if out["similarity_group"].isna().any():
-        raise ValueError("Des similarity_group sont restés vides après remplissage.")
-
+    isolated = out["similarity_group"].isna()
+    out.loc[isolated, "similarity_group"] = "single_" + out.index[isolated].astype(str)
     return out
 
 
-def split_stratifie_par_groupe(
-    df: pd.DataFrame, n_splits: int, seed: int
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Coupe df en (grande part, petite part) de taille 1/n_splits.
+def stratified_group_split(df, n_splits, seed):
+    """Split df into (large part, 1/n_splits part).
 
-    GroupShuffleSplit accepte `y=` mais l'ignore : avec 175 images pour Diode-Multi,
-    la répartition des classes rares serait laissée au hasard. StratifiedGroupKFold non.
+    GroupShuffleSplit ignores `y`, which would leave the rare classes (175 Diode-Multi images)
+    to chance; StratifiedGroupKFold does not.
     """
     sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    idx_grand, idx_petit = next(
-        sgkf.split(df, y=df["label"], groups=df["similarity_group"])
-    )
-    return df.iloc[idx_grand].copy(), df.iloc[idx_petit].copy()
+    large_idx, small_idx = next(sgkf.split(df, y=df["label"], groups=df["similarity_group"]))
+    return df.iloc[large_idx].copy(), df.iloc[small_idx].copy()
 
 
-def verifier_absence_de_fuite(splits: dict[str, pd.DataFrame]) -> None:
-    """Échoue si un groupe de similarité apparaît dans deux splits."""
-    groupes = {nom: set(d["similarity_group"]) for nom, d in splits.items()}
-    noms = list(groupes)
-
-    for i, a in enumerate(noms):
-        for b in noms[i + 1:]:
-            commun = groupes[a] & groupes[b]
-            if commun:
-                raise ValueError(
-                    f"Fuite entre {a} et {b} : {len(commun)} groupes communs "
-                    f"(ex. {sorted(commun)[:3]})"
-                )
-            print(f"  Groupes communs {a}/{b} : 0")
+def check_no_leakage(splits):
+    """Raise if a similarity group appears in two splits."""
+    groups = {name: set(d["similarity_group"]) for name, d in splits.items()}
+    names = list(groups)
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            shared = groups[a] & groups[b]
+            if shared:
+                raise ValueError(f"Leakage between {a} and {b}: {len(shared)} shared groups "
+                                 f"(e.g. {sorted(shared)[:3]})")
+            print(f"  Shared groups {a}/{b}: 0")
 
 
-def rapport_stratification(splits: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Proportions de chaque classe dans chaque split, pour contrôle visuel."""
+def stratification_report(splits):
+    """Share of each class in each split."""
     return pd.concat(
-        {nom: d["label"].value_counts(normalize=True) for nom, d in splits.items()},
+        {name: d["label"].value_counts(normalize=True) for name, d in splits.items()},
         axis=1,
     ).round(4)
 
 
-def preparer_splits(
-    source_csv: Path, n_splits_test: int, n_splits_val: int, seed: int
-) -> dict[str, pd.DataFrame]:
-    """Enchaîne lecture, remplissage des groupes et double découpage."""
+def build_splits(source_csv, n_splits_test, n_splits_val, seed):
     df = pd.read_csv(source_csv)
-    print(f"Source : {source_csv}  ({len(df)} lignes)")
+    print(f"Source: {source_csv}  ({len(df)} rows)")
+    df = assign_singleton_groups(df)
 
-    df = assigner_groupes_uniques(df)
-
-    # Deux découpages successifs : on sort d'abord le test, puis la validation
-    # depuis ce qui reste. La validation sert à régler les hyperparamètres,
-    # ce qui évite de contaminer le test en le regardant à chaque essai.
-    train_val, test = split_stratifie_par_groupe(df, n_splits_test, seed)
-    train, val = split_stratifie_par_groupe(train_val, n_splits_val, seed)
-
+    # Test first, then validation from the rest: validation is used for tuning, test is never seen.
+    train_val, test = stratified_group_split(df, n_splits_test, seed)
+    train, val = stratified_group_split(train_val, n_splits_val, seed)
     return {"train": train, "val": val, "test": test}
 
 
-def ecrire_splits(splits: dict[str, pd.DataFrame], out_dir: Path) -> None:
-    """Écrit un CSV par split dans out_dir."""
+def write_splits(splits, out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
+    for name, d in splits.items():
+        path = out_dir / SPLIT_FILES[name]
+        d.to_csv(path, index=False)
+        print(f"  {path}  ({len(d)} rows)")
 
-    for nom, d in splits.items():
-        chemin = out_dir / SPLIT_FILES[nom]
-        d.to_csv(chemin, index=False)
-        print(f"  {chemin}  ({len(d)} lignes)")
 
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--source", type=Path, default=SOURCE_CSV,
-                        help="CSV d'entrée (défaut : data/dataset_eda.csv)")
+                        help="input CSV (default: data/dataset_eda.csv)")
     parser.add_argument("--out-dir", type=Path, default=DATA_DIR,
-                        help="Dossier de sortie des splits (défaut : data/)")
+                        help="output folder for the splits (default: data/)")
     parser.add_argument("--n-splits-test", type=int, default=5,
-                        help="1/N du total part en test (défaut : 5, soit 20%%)")
+                        help="1/N of the data goes to test (default: 5, i.e. 20%%)")
     parser.add_argument("--n-splits-val", type=int, default=5,
-                        help="1/N du reste part en validation (défaut : 5)")
+                        help="1/N of the rest goes to validation (default: 5)")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args(argv)
 
     if not args.source.exists():
-        print(f"Fichier introuvable : {args.source}", file=sys.stderr)
+        print(f"File not found: {args.source}", file=sys.stderr)
         return 1
 
-    splits = preparer_splits(
-        args.source, args.n_splits_test, args.n_splits_val, args.seed
-    )
+    splits = build_splits(args.source, args.n_splits_test, args.n_splits_val, args.seed)
 
-    print("\nTailles :")
-    for nom, d in splits.items():
-        print(f"  {nom:5s} : {len(d):6d}")
+    print("\nSizes:")
+    for name, d in splits.items():
+        print(f"  {name:5s}: {len(d):6d}")
 
-    print("\nStratification (proportion par classe) :")
-    print(rapport_stratification(splits).to_string())
+    print("\nStratification (share per class):")
+    print(stratification_report(splits).to_string())
 
-    print("\nContrôle de fuite :")
-    verifier_absence_de_fuite(splits)
+    print("\nLeakage check:")
+    check_no_leakage(splits)
 
-    print("\nÉcriture :")
-    ecrire_splits(splits, args.out_dir)
-
+    print("\nWriting:")
+    write_splits(splits, args.out_dir)
     return 0
 
 

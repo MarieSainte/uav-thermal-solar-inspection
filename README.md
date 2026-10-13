@@ -191,8 +191,6 @@ To measure the impact, the trained binary CNN was evaluated on the test set with
 └── pyproject.toml                # uv project, PyTorch CUDA 11.8 wheels
 ```
 
-> The docstrings and comments in `scripts/` are written in French.
-
 ## Reproducing the results
 
 ```bash
